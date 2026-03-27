@@ -43,3 +43,11 @@ itchat.pkl
 QR.png
 .history
 venv/
+.venv/
+.feishu_user_token.json
+artifacts/
+page_dump.html
+test_multi_keyword.py
+test_multi_keyword_2.py
+test_multi_keyword_3.py
+test_timeframe.py

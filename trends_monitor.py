@@ -1,386 +1,761 @@
-import os
-import pandas as pd
-from datetime import datetime, timedelta
-import schedule
-import time
-import random
-from querytrends import batch_get_queries, save_related_queries, RequestLimiter
-import json
-import logging
-import backoff
 import argparse
+import logging
+import os
+import random
+import shutil
+import time
+import uuid
+from datetime import datetime, timedelta
+
+import backoff
+import pandas as pd
+import schedule
+
 from config import (
-    EMAIL_CONFIG, 
-    KEYWORDS, 
-    RATE_LIMIT_CONFIG, 
-    SCHEDULE_CONFIG,
-    MONITOR_CONFIG,
+    FEISHU_CONFIG,
+    KEYWORD_LIBRARY_CONFIG,
+    KEYWORDS,
     LOGGING_CONFIG,
+    MONITOR_CONFIG,
+    OPPORTUNITY_PIPELINE_CONFIG,
+    RATE_LIMIT_CONFIG,
+    SCHEDULE_CONFIG,
     STORAGE_CONFIG,
     TRENDS_CONFIG,
-    NOTIFICATION_CONFIG
+)
+from feishu_workbook import FeishuWorkbook
+from keyword_library import (
+    get_keywords_for_source,
+    load_keyword_library_payload,
+    sync_keyword_library,
 )
 from notification import NotificationManager
+from opportunity_analyzer import DEFAULT_ANALYSIS, OpportunityAnalyzer
+from serp_collector import GoogleSerpCollector, SerpSummary
+from querytrends import batch_get_queries, close_browser_related_queries_collector, save_related_queries
+from trend_validator import validate_rising_candidates
 
-# Configure logging
+
 logging.basicConfig(
-    level=getattr(logging, LOGGING_CONFIG['level']),
-    format=LOGGING_CONFIG['format'],
+    level=getattr(logging, LOGGING_CONFIG["level"]),
+    format=LOGGING_CONFIG["format"],
     handlers=[
-        logging.FileHandler(LOGGING_CONFIG['log_file']),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler(LOGGING_CONFIG["log_file"]),
+        logging.StreamHandler(),
+    ],
 )
 
-# 创建请求限制器实例
-request_limiter = RequestLimiter()
 
-# 创建通知管理器实例
 notification_manager = NotificationManager()
 
-def send_email(subject, body, attachments=None):
-    """Send email with optional attachments"""
-    try:
-        msg = MIMEMultipart()
-        msg['From'] = EMAIL_CONFIG['sender_email']
-        msg['To'] = EMAIL_CONFIG['recipient_email']
-        msg['Subject'] = subject
-
-        msg.attach(MIMEText(body, 'html'))
-
-        if attachments:
-            for filepath in attachments:
-                with open(filepath, 'rb') as f:
-                    part = MIMEApplication(f.read(), Name=os.path.basename(filepath))
-                part['Content-Disposition'] = f'attachment; filename="{os.path.basename(filepath)}"'
-                msg.attach(part)
-
-        # Gmail使用SMTP然后升级到TLS
-        with smtplib.SMTP(EMAIL_CONFIG['smtp_server'], EMAIL_CONFIG['smtp_port']) as server:
-            server.ehlo()  # 可以帮助识别连接问题
-            server.starttls()  # 升级到TLS连接
-            server.ehlo()  # 重新识别
-            logging.info("Attempting to login to Gmail...")
-            server.login(EMAIL_CONFIG['sender_email'], EMAIL_CONFIG['sender_password'])
-            logging.info("Login successful, sending email...")
-            server.send_message(msg)
-            
-        logging.info(f"Email sent successfully: {subject}")
-        return True
-    except Exception as e:
-        logging.error(f"Failed to send email: {str(e)}")
-        logging.error(f"Email configuration used: server={EMAIL_CONFIG['smtp_server']}, port={EMAIL_CONFIG['smtp_port']}")
-        # 不要立即抛出异常，让程序继续运行
-        return False
 
 def create_daily_directory():
-    """Create a directory for today's data"""
-    today = datetime.now().strftime('%Y%m%d')
+    today = datetime.now().strftime("%Y%m%d")
     directory = f"{STORAGE_CONFIG['data_dir_prefix']}{today}"
-    if not os.path.exists(directory):
-        os.makedirs(directory)
+    os.makedirs(directory, exist_ok=True)
     return directory
 
-def check_rising_trends(data, keyword, threshold=MONITOR_CONFIG['rising_threshold']):
-    """Check if any rising trends exceed the threshold"""
-    if not data or 'rising' not in data or data['rising'] is None:
-        return []
-    
-    rising_trends = []
-    df = data['rising']
-    if isinstance(df, pd.DataFrame):
-        for _, row in df.iterrows():
-            if row['value'] > threshold:
-                rising_trends.append((row['query'], row['value']))
-    return rising_trends
-
-def generate_daily_report(results, directory):
-    """Generate a daily report in CSV format"""
-    report_data = []
-    
-    for keyword, data in results.items():
-        if data and isinstance(data.get('rising'), pd.DataFrame):
-            rising_df = data['rising']
-            for _, row in rising_df.iterrows():
-                report_data.append({
-                    'keyword': keyword,
-                    'related_keywords': row['query'],
-                    'value': row['value'],
-                    'type': 'rising'
-                })
-        
-        if data and isinstance(data.get('top'), pd.DataFrame):
-            top_df = data['top']
-            for _, row in top_df.iterrows():
-                report_data.append({
-                    'keyword': keyword,
-                    'related_keywords': row['query'],
-                    'value': row['value'],
-                    'type': 'top'
-                })
-    
-    if report_data:
-        df = pd.DataFrame(report_data)
-        filename = f"{STORAGE_CONFIG['report_filename_prefix']}{datetime.now().strftime('%Y%m%d')}.csv"
-        report_file = os.path.join(directory, filename)
-        df.to_csv(report_file, index=False)
-        return report_file
-    return None
 
 def get_date_range_timeframe(timeframe):
-    """Convert special timeframe formats to date range format
-    
-    Args:
-        timeframe (str): Timeframe string like 'last-2-d' or 'last-3-d'
-        
-    Returns:
-        str: Date range format string like '2024-01-01 2024-01-31'
-    """
-    if not timeframe.startswith('last-'):
+    if not timeframe.startswith("last-"):
         return timeframe
-        
+
     try:
-        # 解析天数
-        days = int(timeframe.split('-')[1])
+        days = int(timeframe.split("-")[1])
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
-        # 格式化日期字符串
         return f"{start_date.strftime('%Y-%m-%d')} {end_date.strftime('%Y-%m-%d')}"
     except (ValueError, IndexError):
-        logging.warning(f"Invalid timeframe format: {timeframe}, falling back to 'now 1-d'")
-        return 'now 1-d'
+        logging.warning("Invalid timeframe format: %s, fallback to 'now 1-d'", timeframe)
+        return "now 1-d"
 
-def process_keywords_batch(keywords_batch, directory, all_results, high_rising_trends, timeframe):
-    """处理一批关键词"""
-    try:
-        logging.info(f"Processing batch of {len(keywords_batch)} keywords")
-        logging.info(f"Query parameters: timeframe={timeframe}, geo={TRENDS_CONFIG['geo'] or 'Global'}")
-        
-        # 使用传入的 timeframe 参数
-        results = get_trends_with_retry(keywords_batch, timeframe)
-        
-        for keyword, data in results.items():
-            if data:
-                filename = save_related_queries(keyword, data)
-                if filename:
-                    os.rename(filename, os.path.join(directory, filename))
-                
-                rising_trends = check_rising_trends(data, keyword)
-                if rising_trends:
-                    high_rising_trends.extend([(keyword, related_keywords, value) 
-                                             for related_keywords, value in rising_trends])
-                
-                all_results[keyword] = data
-        
-        return True
-    except Exception as e:
-        logging.error(f"Error processing batch: {str(e)}")
+
+def generate_daily_report(results, directory):
+    report_data = []
+
+    for keyword, data in results.items():
+        if data and isinstance(data.get("rising"), pd.DataFrame):
+            for _, row in data["rising"].iterrows():
+                report_data.append(
+                    {
+                        "keyword": keyword,
+                        "related_keywords": row["query"],
+                        "value": row["value"],
+                        "type": "rising",
+                    }
+                )
+
+        if data and isinstance(data.get("top"), pd.DataFrame):
+            for _, row in data["top"].iterrows():
+                report_data.append(
+                    {
+                        "keyword": keyword,
+                        "related_keywords": row["query"],
+                        "value": row["value"],
+                        "type": "top",
+                    }
+                )
+
+    if not report_data:
+        return None
+
+    filename = f"{STORAGE_CONFIG['report_filename_prefix']}{datetime.now().strftime('%Y%m%d')}.csv"
+    report_file = os.path.join(directory, filename)
+    pd.DataFrame(report_data).to_csv(report_file, index=False)
+    return report_file
+
+
+def is_rising_alert_value(value):
+    if isinstance(value, str):
+        return value.strip().lower() == "breakout"
+    if pd.isna(value):
         return False
+    try:
+        return float(value) > MONITOR_CONFIG["rising_threshold"]
+    except (TypeError, ValueError):
+        return False
+
+
+def build_detail_rows(run_context, keyword, data, source_json_file, keyword_meta):
+    detail_rows = []
+    collected_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for trend_type in ("top", "rising"):
+        dataframe = data.get(trend_type)
+        if not isinstance(dataframe, pd.DataFrame):
+            continue
+
+        for _, row in dataframe.iterrows():
+            value = row["value"]
+            is_rising_alert = trend_type == "rising" and is_rising_alert_value(value)
+            detail_rows.append(
+                {
+                    "run_id": run_context["run_id"],
+                    "run_date": run_context["run_date"],
+                    "collected_at": collected_at,
+                    "keyword_source": run_context["keyword_source"],
+                    "keyword_category": keyword_meta.get("category", ""),
+                    "keyword": keyword,
+                    "trend_type": trend_type,
+                    "related_query": row["query"],
+                    "value": value,
+                    "is_rising_alert": "true" if is_rising_alert else "false",
+                    "timeframe_actual": run_context["timeframe_actual"],
+                    "geo": run_context["geo"],
+                    "source_json_file": source_json_file,
+                }
+            )
+
+    return detail_rows
+
+
+def collect_rising_alerts(detail_rows):
+    return [
+        {
+            "keyword": row["keyword"],
+            "related_query": row["related_query"],
+            "value": row["value"],
+            "keyword_category": row.get("keyword_category", ""),
+        }
+        for row in detail_rows
+        if row["trend_type"] == "rising" and row["is_rising_alert"] == "true"
+    ]
+
+
+def build_summary_row(
+    run_context,
+    report_csv_path,
+    data_directory,
+    keywords_total,
+    keywords_success,
+    keywords_failed,
+    rising_alert_count,
+    status,
+    error_message="",
+):
+    return {
+        "run_id": run_context["run_id"],
+        "run_date": run_context["run_date"],
+        "started_at": run_context["started_at"],
+        "finished_at": run_context["finished_at"],
+        "keyword_source": run_context["keyword_source"],
+        "timeframe_requested": run_context["timeframe_requested"],
+        "timeframe_actual": run_context["timeframe_actual"],
+        "geo": run_context["geo"],
+        "keywords_total": keywords_total,
+        "keywords_success": keywords_success,
+        "keywords_failed": keywords_failed,
+        "rising_alert_count": rising_alert_count,
+        "report_csv_path": report_csv_path or "",
+        "data_directory": data_directory or "",
+        "status": status,
+        "error_message": error_message,
+    }
+
+
+def resolve_run_keywords(requested_source=None, manual_keywords=None, refresh_keyword_library=False):
+    if manual_keywords:
+        return {
+            "keywords": manual_keywords,
+            "keyword_source": "manual",
+            "keyword_index": {},
+            "library_payload": None,
+        }
+
+    if not KEYWORD_LIBRARY_CONFIG["enabled"]:
+        return {
+            "keywords": list(KEYWORDS),
+            "keyword_source": "static",
+            "keyword_index": {},
+            "library_payload": None,
+        }
+
+    if refresh_keyword_library:
+        payload, _ = sync_keyword_library()
+    else:
+        payload = load_keyword_library_payload(refresh_if_missing=True)
+
+    keyword_source = requested_source or KEYWORD_LIBRARY_CONFIG["default_run_source"]
+    keywords = get_keywords_for_source(payload, keyword_source)
+    return {
+        "keywords": keywords,
+        "keyword_source": keyword_source,
+        "keyword_index": payload.get("keyword_index", {}),
+        "library_payload": payload,
+    }
+
 
 @backoff.on_exception(
     backoff.expo,
     Exception,
-    max_tries=RATE_LIMIT_CONFIG['max_retries'],
-    jitter=backoff.full_jitter
+    max_tries=RATE_LIMIT_CONFIG["max_retries"],
+    jitter=backoff.full_jitter,
 )
 def get_trends_with_retry(keywords_batch, timeframe):
-    """使用重试机制获取趋势数据"""
     return batch_get_queries(
         keywords_batch,
-        timeframe=timeframe,  # 使用传入的 timeframe
-        geo=TRENDS_CONFIG['geo'],
+        timeframe=timeframe,
+        geo=TRENDS_CONFIG["geo"],
         delay_between_queries=random.uniform(
-            RATE_LIMIT_CONFIG['min_delay_between_queries'],
-            RATE_LIMIT_CONFIG['max_delay_between_queries']
-        )
+            RATE_LIMIT_CONFIG["min_delay_between_queries"],
+            RATE_LIMIT_CONFIG["max_delay_between_queries"],
+        ),
     )
 
-def process_trends():
-    """Main function to process trends data"""
+
+def send_daily_summary_notification(summary_row, workbook_url):
+    return notification_manager.send_notification(
+        "daily_summary",
+        {
+            "summary": summary_row,
+            "workbook_url": workbook_url,
+        },
+    )
+
+
+def send_rising_alert_notification(summary_row, alerts):
+    if not alerts:
+        return False
+    return notification_manager.send_notification(
+        "rising_alert",
+        {
+            "summary": summary_row,
+            "alerts": alerts,
+        },
+    )
+
+
+def send_error_notification(summary_row, error_message):
+    return notification_manager.send_notification(
+        "error",
+        {
+            "summary": summary_row,
+            "error_message": error_message,
+        },
+    )
+
+
+def send_opportunity_alert_notification(summary_row, opportunities, workbook_url):
+    if not opportunities or not OPPORTUNITY_PIPELINE_CONFIG["opportunity_alert_enabled"]:
+        return False
+    return notification_manager.send_notification(
+        "opportunity_alert",
+        {
+            "summary": summary_row,
+            "opportunities": opportunities,
+            "workbook_url": workbook_url,
+        },
+    )
+
+
+def build_opportunity_review_row(run_context, candidate, serp_summary, analysis):
+    decision = analysis.get("decision", "watch")
+    collected_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return {
+        "run_id": run_context["run_id"],
+        "keyword_source": run_context["keyword_source"],
+        "seed_keyword": candidate.seed_keyword,
+        "candidate_keyword": candidate.candidate_keyword,
+        "trend_type": candidate.trend_type,
+        "seven_day_value": candidate.seven_day_value,
+        "thirty_day_value": candidate.thirty_day_value,
+        "growth_persistence": candidate.growth_persistence,
+        "is_new_term": "true" if candidate.is_new_term else "false",
+        "serp_result_count": serp_summary.result_count,
+        "serp_ads_present": "true" if serp_summary.ads_present else "false",
+        "serp_product_pages": serp_summary.product_pages,
+        "serp_forum_pages": serp_summary.forum_pages,
+        "serp_pricing_pages": serp_summary.pricing_pages,
+        "serp_summary": serp_summary.summary,
+        "ai_demand_score": analysis.get("demand_score", ""),
+        "ai_payment_intent_score": analysis.get("payment_intent_score", ""),
+        "ai_commercial_intent": analysis.get("commercial_intent", ""),
+        "ai_topic_type": analysis.get("topic_type", ""),
+        "ai_target_user": analysis.get("target_user", ""),
+        "ai_why_now": analysis.get("why_now", ""),
+        "ai_short_reason": analysis.get("short_reason", ""),
+        "ai_noise_flag": (
+            str(analysis.get("noise_flag", "")).lower()
+            if analysis.get("noise_flag", "") != ""
+            else ""
+        ),
+        "decision": decision,
+        "collected_at": collected_at,
+    }
+
+
+def run_opportunity_pipeline(run_context, alerts, keyword_index, pipeline_options):
+    if not pipeline_options["enabled"] or not alerts:
+        return []
+
+    candidates = validate_rising_candidates(
+        alerts,
+        run_context["keyword_source"],
+        keyword_index,
+        run_context["run_date"],
+    )
+    candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.validation_status == "validated" and candidate.is_new_term
+    ]
+    if not candidates:
+        return []
+
+    collector = None if pipeline_options["skip_serp"] else GoogleSerpCollector()
+    analyzer = OpportunityAnalyzer()
+    opportunity_rows = []
+
     try:
-        logging.info("Starting daily trends processing")
-        
-        # 处理特殊的 timeframe 格式
-        timeframe = TRENDS_CONFIG['timeframe']
-        actual_timeframe = get_date_range_timeframe(timeframe)
-        
-        logging.info(f"Using configuration: timeframe={actual_timeframe}, geo={TRENDS_CONFIG['geo'] or 'Global'}")
-        directory = create_daily_directory()
-        
-        all_results = {}
-        high_rising_trends = []
-        
-        # 将关键词分批处理，使用实际的 timeframe
-        for i in range(0, len(KEYWORDS), RATE_LIMIT_CONFIG['batch_size']):
-            keywords_batch = KEYWORDS[i:i + RATE_LIMIT_CONFIG['batch_size']]
-            # 传递实际的 timeframe 到查询函数
-            success = process_keywords_batch(
-                keywords_batch, 
-                directory, 
-                all_results, 
-                high_rising_trends,
-                actual_timeframe
+        for candidate in candidates[: pipeline_options["max_candidates"]]:
+            serp_summary = (
+                SerpSummary(
+                    status="skipped",
+                    result_count=0,
+                    ads_present=False,
+                    product_pages=0,
+                    forum_pages=0,
+                    pricing_pages=0,
+                    summary="SERP collection skipped by CLI flag.",
+                    results=[],
+                )
+                if collector is None
+                else collector.search(candidate.candidate_keyword)
             )
-            
-            if not success:
-                logging.error(f"Failed to process batch starting with keyword: {keywords_batch[0]}")
-                continue
-            
-            # 如果不是最后一批，等待一段时间再处理下一批
-            if i + RATE_LIMIT_CONFIG['batch_size'] < len(KEYWORDS):
-                wait_time = RATE_LIMIT_CONFIG['batch_interval'] + random.uniform(0, 60)
-                logging.info(f"Waiting {wait_time:.1f} seconds before processing next batch...")
+
+            if pipeline_options["skip_ai"] or not analyzer.is_enabled():
+                analysis = dict(DEFAULT_ANALYSIS)
+                analysis.update(
+                    {
+                        "demand_score": "",
+                        "payment_intent_score": "",
+                        "commercial_intent": "unavailable",
+                        "topic_type": "",
+                        "target_user": "",
+                        "why_now": "",
+                        "short_reason": "AI analysis skipped or API key missing.",
+                        "noise_flag": "",
+                        "decision": "watch",
+                    }
+                )
+            else:
+                try:
+                    analysis = analyzer.analyze(candidate, serp_summary)
+                except Exception as exc:
+                    logging.warning("AI analysis failed for %s: %s", candidate.candidate_keyword, exc)
+                    analysis = dict(DEFAULT_ANALYSIS)
+                    analysis.update(
+                        {
+                            "demand_score": "",
+                            "payment_intent_score": "",
+                            "commercial_intent": "error",
+                            "topic_type": "",
+                            "target_user": "",
+                            "why_now": "",
+                            "short_reason": f"AI analysis failed: {exc}",
+                            "noise_flag": "",
+                            "decision": "watch",
+                        }
+                    )
+
+            opportunity_rows.append(
+                build_opportunity_review_row(run_context, candidate, serp_summary, analysis)
+            )
+    finally:
+        if collector is not None:
+            collector.close()
+
+    return opportunity_rows
+
+
+def process_trends(keywords, keyword_source, keyword_index=None, pipeline_options=None):
+    keyword_index = keyword_index or {}
+    pipeline_options = pipeline_options or {
+        "enabled": OPPORTUNITY_PIPELINE_CONFIG["enabled"],
+        "max_candidates": OPPORTUNITY_PIPELINE_CONFIG["max_candidates_per_run"],
+        "skip_serp": False,
+        "skip_ai": False,
+    }
+    started_at = datetime.now()
+    run_context = {
+        "run_id": uuid.uuid4().hex[:12],
+        "run_date": started_at.strftime("%Y-%m-%d"),
+        "started_at": started_at.strftime("%Y-%m-%d %H:%M:%S"),
+        "keyword_source": keyword_source,
+        "timeframe_requested": TRENDS_CONFIG["timeframe"],
+        "timeframe_actual": get_date_range_timeframe(TRENDS_CONFIG["timeframe"]),
+        "geo": TRENDS_CONFIG["geo"] or "Global",
+        "finished_at": "",
+    }
+
+    directory = None
+    report_file = None
+    all_results = {}
+    detail_rows = []
+    opportunity_rows = []
+    failed_keywords = []
+    workbook = None
+    summary_synced = False
+    detail_sync_attempted = False
+
+    try:
+        logging.info(
+            "Starting trends processing run_id=%s source=%s timeframe=%s geo=%s",
+            run_context["run_id"],
+            run_context["keyword_source"],
+            run_context["timeframe_actual"],
+            run_context["geo"],
+        )
+        directory = create_daily_directory()
+
+        for index in range(0, len(keywords), RATE_LIMIT_CONFIG["batch_size"]):
+            keywords_batch = keywords[index : index + RATE_LIMIT_CONFIG["batch_size"]]
+            logging.info("Processing batch: %s", keywords_batch)
+            results = get_trends_with_retry(keywords_batch, run_context["timeframe_actual"])
+
+            for keyword in keywords_batch:
+                data = results.get(keyword)
+                if not data:
+                    failed_keywords.append(keyword)
+                    continue
+
+                filename = save_related_queries(keyword, data)
+                source_json_file = ""
+                if filename:
+                    destination = os.path.join(directory, os.path.basename(filename))
+                    shutil.move(filename, destination)
+                    source_json_file = destination
+
+                all_results[keyword] = data
+                detail_rows.extend(
+                    build_detail_rows(
+                        run_context,
+                        keyword,
+                        data,
+                        source_json_file,
+                        keyword_index.get(keyword, {}),
+                    )
+                )
+
+            if index + RATE_LIMIT_CONFIG["batch_size"] < len(keywords):
+                wait_time = RATE_LIMIT_CONFIG["batch_interval"] + random.uniform(0, 60)
+                logging.info("Waiting %.1f seconds before the next batch", wait_time)
                 time.sleep(wait_time)
 
-        # Generate and send daily report
         report_file = generate_daily_report(all_results, directory)
-        if report_file:
-            report_body = """
-            <h2>Daily Trends Report</h2>
-            <p>Please find attached the daily trends report.</p>
-            <p>Query Parameters:</p>
-            <ul>
-            <li>Time Range: {}</li>
-            <li>Region: {}</li>
-            </ul>
-            <p>Summary:</p>
-            <ul>
-            <li>Total keywords processed: {}</li>
-            <li>Successful queries: {}</li>
-            <li>Failed queries: {}</li>
-            </ul>
-            """.format(
-                TRENDS_CONFIG['timeframe'],
-                TRENDS_CONFIG['geo'] or 'Global',
-                len(KEYWORDS),
-                len(all_results),
-                len(KEYWORDS) - len(all_results)
-            )
-            if not notification_manager.send_notification(
-                subject=f"Daily Trends Report - {datetime.now().strftime('%Y-%m-%d')}",
-                body=report_body,
-                attachments=[report_file]
-            ):
-                logging.warning("Failed to send daily report, but data collection completed")
-        
-        # Send alerts for high rising trends
-        if high_rising_trends:
-            # 将高趋势分批处理，每批最多10个趋势
-            batch_size = 10
-            for i in range(0, len(high_rising_trends), batch_size):
-                batch_trends = high_rising_trends[i:i + batch_size]
-                batch_number = i // batch_size + 1
-                total_batches = (len(high_rising_trends) + batch_size - 1) // batch_size
-                
-                alert_body = f"""
-                <h2>📊 High Rising Trends Alert</h2>
-                <hr>
-                <h3>📌 Query Parameters:</h3>
-                <ul>
-                    <li>🕒 Time Range: {TRENDS_CONFIG['timeframe']}</li>
-                    <li>🌍 Region: {TRENDS_CONFIG['geo'] or 'Global'}</li>
-                </ul>
-                <h3>📈 Significant Growth Trends:</h3>
-                <table border="1" cellpadding="5" style="border-collapse: collapse;">
-                    <tr>
-                        <th>🔍 Base Keyword</th>
-                        <th>🔗 Related Query</th>
-                        <th>📈 Growth</th>
-                    </tr>
-                """
-                
-                for keyword, related_keywords, value in batch_trends:
-                    alert_body += f"""
-                    <tr>
-                        <td><strong>🎯 {keyword}</strong></td>
-                        <td>➡️ {related_keywords}</td>
-                        <td align="right" style="color: #28a745;">⬆️ {value}%</td>
-                    </tr>
-                    """
-                
-                alert_body += "</table>"
-                
-                if batch_number < total_batches:
-                    alert_body += f"<p><i>This is batch {batch_number} of {total_batches}. More results will follow.</i></p>"
-                
-                if not notification_manager.send_notification(
-                    subject=f"📊 Rising Trends Alert ({batch_number}/{total_batches})",
-                    body=alert_body
-                ):
-                    logging.warning(f"Failed to send alert notification for batch {batch_number}, but data collection completed")
-                
-                # 添加短暂延迟，避免消息发送过快
-                time.sleep(2)
-        
-        logging.info("Daily trends processing completed successfully")
-        return True
-    except Exception as e:
-        logging.error(f"Error in trends processing: {str(e)}")
-        notification_manager.send_notification(
-            subject="❌ Error in Trends Processing",
-            body=f"<p>An error occurred during trends processing:</p><pre>{str(e)}</pre>"
-        )
-        return False
+        run_context["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        alerts = collect_rising_alerts(detail_rows)
 
-def run_scheduler():
-    """Run the scheduler"""
-    # 从配置中获取小时和分钟
-    schedule_hour = SCHEDULE_CONFIG['hour']
-    schedule_minute = SCHEDULE_CONFIG.get('minute', 0)  # 默认为0分钟
-    
-    # 添加随机延迟（如果配置了的话）
-    if SCHEDULE_CONFIG.get('random_delay_minutes', 0) > 0:
-        random_minutes = random.randint(0, SCHEDULE_CONFIG['random_delay_minutes'])
-        schedule_minute = (schedule_minute + random_minutes) % 60
-        # 如果分钟数超过59，需要调整小时数
-        schedule_hour = (schedule_hour + (schedule_minute + random_minutes) // 60) % 24
-    
+        # 【优化3：日志准确性】根据实际采集结果决定最终状态
+        # - 全部成功：completed
+        # - 部分成功：partial_success
+        # - 全部失败：all_failed（触发 error 通知，不假装成功）
+        if not failed_keywords:
+            status = "completed"
+        elif len(all_results) > 0:
+            status = "partial_success"
+        else:
+            status = "all_failed"
+
+        error_message = f"所有 {len(keywords)} 个关键词均采集失败，请检查网络和浏览器状态。" if status == "all_failed" else ""
+
+        summary_row = build_summary_row(
+            run_context=run_context,
+            report_csv_path=report_file,
+            data_directory=directory,
+            keywords_total=len(keywords),
+            keywords_success=len(all_results),
+            keywords_failed=len(failed_keywords),
+            rising_alert_count=len(alerts),
+            status=status,
+            error_message=error_message,
+        )
+
+        workbook = FeishuWorkbook.from_config()
+        workbook.append_daily_summary(summary_row)
+        summary_synced = True
+        detail_sync_attempted = True
+        workbook.append_trend_details(detail_rows)
+
+        # 【优化3】全部失败时发送错误通知，而不是乐观的日常汇报
+        if status == "all_failed":
+            logging.error("所有关键词采集均失败，触发错误通知。")
+            send_error_notification(summary_row, error_message)
+        else:
+            send_daily_summary_notification(summary_row, workbook.spreadsheet_url)
+            if alerts:
+                send_rising_alert_notification(summary_row, alerts)
+        close_browser_related_queries_collector()
+        try:
+            opportunity_rows = run_opportunity_pipeline(
+                run_context,
+                alerts,
+                keyword_index,
+                pipeline_options,
+            )
+            if opportunity_rows:
+                workbook.append_opportunity_reviews(opportunity_rows)
+                opportunity_alerts = [
+                    row for row in opportunity_rows if row.get("decision") == "opportunity"
+                ]
+                if opportunity_alerts:
+                    send_opportunity_alert_notification(
+                        summary_row,
+                        opportunity_alerts,
+                        workbook.spreadsheet_url,
+                    )
+        except Exception as opportunity_exc:
+            logging.exception("Opportunity pipeline failed: %s", opportunity_exc)
+
+        logging.info("Trends processing completed successfully for run_id=%s", run_context["run_id"])
+        return {
+            "summary": summary_row,
+            "alerts": alerts,
+            "detail_rows": detail_rows,
+            "opportunity_rows": opportunity_rows,
+            "failed_keywords": failed_keywords,
+            "workbook_url": workbook.spreadsheet_url,
+        }
+    except Exception as exc:
+        close_browser_related_queries_collector()
+        logging.exception("Error in trends processing")
+        run_context["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        error_message = str(exc)
+        alerts = collect_rising_alerts(detail_rows)
+        summary_row = build_summary_row(
+            run_context=run_context,
+            report_csv_path=report_file,
+            data_directory=directory,
+            keywords_total=len(keywords),
+            keywords_success=len(all_results),
+            keywords_failed=max(len(keywords) - len(all_results), len(failed_keywords)),
+            rising_alert_count=len(alerts),
+            status="failed",
+            error_message=error_message,
+        )
+
+        workbook_url = ""
+        try:
+            if workbook is None:
+                workbook = FeishuWorkbook.from_config()
+            workbook_url = workbook.spreadsheet_url
+            if not summary_synced:
+                workbook.append_daily_summary(summary_row)
+            if detail_rows and not detail_sync_attempted:
+                workbook.append_trend_details(detail_rows)
+        except Exception as workbook_exc:
+            logging.exception("Failed to sync error result to Feishu workbook: %s", workbook_exc)
+
+        send_error_notification(summary_row, error_message)
+        return {
+            "summary": summary_row,
+            "alerts": alerts,
+            "detail_rows": detail_rows,
+            "opportunity_rows": opportunity_rows,
+            "failed_keywords": failed_keywords,
+            "workbook_url": workbook_url,
+            "error": error_message,
+        }
+
+
+def validate_runtime_config():
+    placeholder_values = {
+        "your-webhook-token",
+        "cli_xxx",
+        "xxx",
+    }
+
+    def is_placeholder(value):
+        text = str(value or "").strip()
+        if not text:
+            return True
+        if text in placeholder_values:
+            return True
+        return text.endswith("/your-webhook-token")
+
+    if not FEISHU_CONFIG["enabled"]:
+        raise RuntimeError("Feishu integration is disabled. Set FEISHU_ENABLED=true.")
+    if is_placeholder(FEISHU_CONFIG["webhook_url"]):
+        raise RuntimeError("Missing FEISHU_WEBHOOK_URL in .env.")
+    if is_placeholder(FEISHU_CONFIG["app_id"]) or is_placeholder(FEISHU_CONFIG["app_secret"]):
+        raise RuntimeError("Missing FEISHU_APP_ID or FEISHU_APP_SECRET in .env.")
+    if not os.path.exists(FEISHU_CONFIG["user_token_file"]):
+        raise RuntimeError(
+            "Feishu user token file not found. Run `python setup_feishu_user_auth.py` first."
+        )
+
+
+def run_scheduler(keywords, keyword_source, keyword_index=None, pipeline_options=None):
+    schedule_hour = SCHEDULE_CONFIG["hour"]
+    schedule_minute = SCHEDULE_CONFIG.get("minute", 0)
+
+    if SCHEDULE_CONFIG.get("random_delay_minutes", 0) > 0:
+        random_minutes = random.randint(0, SCHEDULE_CONFIG["random_delay_minutes"])
+        total_minutes = schedule_hour * 60 + schedule_minute + random_minutes
+        schedule_hour = (total_minutes // 60) % 24
+        schedule_minute = total_minutes % 60
+
     schedule_time = f"{schedule_hour:02d}:{schedule_minute:02d}"
-    
-    schedule.every().day.at(schedule_time).do(process_trends)
-    
-    logging.info(f"Scheduler started. Will run daily at {schedule_time}")
-    
-    # 如果启动时间接近计划执行时间，等待到下一天
+    schedule.every().day.at(schedule_time).do(
+        process_trends,
+        keywords,
+        keyword_source,
+        keyword_index,
+        pipeline_options,
+    )
+    logging.info("Scheduler started. Will run daily at %s using source=%s", schedule_time, keyword_source)
+
     now = datetime.now()
     scheduled_time = now.replace(hour=schedule_hour, minute=schedule_minute, second=0, microsecond=0)
-    
     if now >= scheduled_time:
-        logging.info("Current time is past scheduled time, waiting for tomorrow")
         next_run = scheduled_time + timedelta(days=1)
+        logging.info("Current time is past the scheduled time, waiting for tomorrow")
         time.sleep((next_run - now).total_seconds())
-    
+
     while True:
         schedule.run_pending()
         time.sleep(60)
 
+
 if __name__ == "__main__":
-    # 创建命令行参数解析器
-    parser = argparse.ArgumentParser(description='Google Trends Monitor')
-    parser.add_argument('--test', action='store_true', 
-                      help='立即运行一次数据收集，而不是等待计划时间')
-    parser.add_argument('--keywords', nargs='+',
-                      help='测试时要查询的关键词列表，如果不指定则使用配置文件中的关键词')
+    parser = argparse.ArgumentParser(description="Google Trends Monitor")
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Run once immediately instead of waiting for the schedule",
+    )
+    parser.add_argument(
+        "--keywords",
+        nargs="+",
+        help="Override configured keywords for test mode",
+    )
+    parser.add_argument(
+        "--timeframe",
+        type=str,
+        help="Override the timeframe for query (e.g., '7d', '30d', 'now 7-d', 'today 1-m')",
+    )
+    parser.add_argument(
+        "--keyword-source",
+        help="Keyword source to use: primary or rotation_group_n",
+    )
+    parser.add_argument(
+        "--refresh-keyword-library",
+        action="store_true",
+        help="Refresh keyword library from Feishu before running",
+    )
+    parser.add_argument(
+        "--sync-keyword-library",
+        action="store_true",
+        help="Sync keyword library artifact from Feishu and exit",
+    )
+    parser.add_argument(
+        "--enable-opportunity-analysis",
+        action="store_true",
+        help="Force-enable the opportunity pipeline for this run",
+    )
+    parser.add_argument(
+        "--max-opportunity-candidates",
+        type=int,
+        help="Override the max number of opportunity candidates per run",
+    )
+    parser.add_argument(
+        "--skip-serp",
+        action="store_true",
+        help="Skip Google SERP collection during opportunity analysis",
+    )
+    parser.add_argument(
+        "--skip-ai",
+        action="store_true",
+        help="Skip AI scoring during opportunity analysis",
+    )
     args = parser.parse_args()
 
-    # 检查邮件配置
-    if not all([
-        EMAIL_CONFIG['sender_email'],
-        EMAIL_CONFIG['sender_password'],
-        EMAIL_CONFIG['recipient_email']
-    ]):
-        logging.error("Please configure email settings in config.py before running")
-        exit(1)
-    
-    # 如果是测试模式
-    if args.test:
-        logging.info("Running in test mode...")
-        if args.keywords:
-            # 临时替换配置文件中的关键词
-            global KEYWORDS
-            KEYWORDS = args.keywords
-            logging.info(f"Using test keywords: {KEYWORDS}")
-        process_trends()
+    validate_runtime_config()
+
+    if args.sync_keyword_library:
+        payload, artifact_path = sync_keyword_library()
+        logging.info(
+            "Keyword library synced to %s with %s primary keywords",
+            artifact_path,
+            payload["stats"]["primary_keyword_count"],
+        )
     else:
-        # 正常的计划任务模式
-        run_scheduler() 
+        # 【优化1】解析命令行提供的 timeframe 并覆盖配置
+        if args.timeframe:
+            timeframe_map = {
+                "7d": "now 7-d",
+                "30d": "today 1-m",
+                "90d": "today 3-m",
+                "12m": "today 12-m",
+            }
+            TRENDS_CONFIG["timeframe"] = timeframe_map.get(args.timeframe, args.timeframe)
+            logging.info("Override timeframe to: %s", TRENDS_CONFIG["timeframe"])
+
+        resolved = resolve_run_keywords(
+            requested_source=args.keyword_source,
+            manual_keywords=args.keywords,
+            refresh_keyword_library=args.refresh_keyword_library,
+        )
+        keywords = resolved["keywords"]
+        keyword_source = resolved["keyword_source"]
+        keyword_index = resolved["keyword_index"]
+
+        logging.info(
+            "Using keyword source=%s with %s keywords",
+            keyword_source,
+            len(keywords),
+        )
+
+        pipeline_options = {
+            "enabled": args.enable_opportunity_analysis or OPPORTUNITY_PIPELINE_CONFIG["enabled"],
+            "max_candidates": args.max_opportunity_candidates
+            or OPPORTUNITY_PIPELINE_CONFIG["max_candidates_per_run"],
+            "skip_serp": args.skip_serp,
+            "skip_ai": args.skip_ai,
+        }
+
+        if args.test:
+            logging.info("Running in test mode")
+            process_trends(keywords, keyword_source, keyword_index, pipeline_options)
+        else:
+            run_scheduler(keywords, keyword_source, keyword_index, pipeline_options)
