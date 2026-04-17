@@ -115,9 +115,9 @@ RATE_LIMIT_CONFIG = {
 }
 
 SCHEDULE_CONFIG = {
-    "hour": 23,
-    "minute": 5,
-    "random_delay_minutes": 15,
+    "hour": 12,
+    "minute": 0,
+    "random_delay_minutes": 0,
 }
 
 MONITOR_CONFIG = {

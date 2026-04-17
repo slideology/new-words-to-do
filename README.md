@@ -211,6 +211,7 @@ python trends_monitor.py
 ```
 
 默认会使用 `KEYWORD_LIBRARY_DEFAULT_RUN_SOURCE`。
+默认会按本机时间每天 `12:00` 执行一次；当前配置已关闭随机延迟。
 
 ## 飞书数据输出
 
@@ -296,6 +297,10 @@ python -m playwright install chromium
   - SERP 继续走 `9444` 调试 Chrome
 - 已把 Google Trends quota 处理改成跨进程共享限流 + `fail_fast`，避免临时测试卡 5-6 分钟
 - 已修复同一进程里 Trends 浏览器采集器和 SERP 采集器的 Playwright 冲突
+- 已将默认定时执行时间调整为本机时间每天 `12:00`，并关闭随机延迟，方便按北京时间中午稳定开跑
+- 已验证任务可直接附着 `Google Chrome Canary` 的 `9444` 调试端口运行：
+  - 浏览器版 Google Trends 采集已确认走 `http://127.0.0.1:9444`
+  - Google 搜索结果抓取也已确认走同一个 `9444` Canary 实例
 - **[新增] 优化1 - 重试机制**：`_open_keyword_page` 失败时自动最多重试 3 次，每次间隔随机 3-7 秒
 - **[新增] 优化2 - 降级备用通道**：浏览器采集全部重试失败后，自动切换到 trendspy API 再尝试一次
 - **[新增] 优化3 - 日志准确性**：关键词采集失败时统一记录 `ERROR` 级别日志；全部失败时最终状态改为 `all_failed` 并触发错误通知，不再假装成功
@@ -314,6 +319,7 @@ python -m playwright install chromium
 - 继续观察 `clicker games` 是否适合作为主监控词，还是更应该下钻到 `cookie clicker`、`auto clicker games` 这类子词
 - 复核 `机会评估` sheet 的字段是否还需要补充，比如 SERP 状态、趋势截图链接、人工备注
 - 视效果决定是否增加“二次深判”模型，只对 `watch/opportunity` 候选做更重的分析
+- 视实际使用方式决定是否补一层“自动拉起 Chrome Canary 9444 实例”的启动脚本或系统级守护方案
 
 ## 常见问题
 
